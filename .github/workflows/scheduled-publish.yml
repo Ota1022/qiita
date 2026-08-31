@@ -1,0 +1,63 @@
+# 2026-09-04 に記事を公開するための単発ワークフロー。公開後はこのファイルを削除してよい。
+name: Scheduled publish (otel-rust-xray)
+
+on:
+  schedule:
+    - cron: "0 0 4 9 *" # UTC 09/04 00:00 = JST 09/04 09:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  ARTICLE: public/otel-rust-xray.md
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 実行してよい日か確認する
+        id: guard
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$(date -u +%Y-%m)" = "2026-09" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "2026-09 以外に発火したため何もしない"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.ok == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: ignorePublish を false にする
+        if: steps.guard.outputs.ok == 'true'
+        run: |
+          test -f "$ARTICLE"
+          sed -i 's/^ignorePublish: true$/ignorePublish: false/' "$ARTICLE"
+          grep -q '^ignorePublish: false$' "$ARTICLE"
+
+      - name: 変更を push する
+        if: steps.guard.outputs.ok == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- "$ARTICLE"; then
+            echo "すでに ignorePublish: false のため commit は不要"
+          else
+            git add "$ARTICLE"
+            git commit -m "記事を公開する"
+            git push
+          fi
+
+      - uses: increments/qiita-cli/actions/publish@v1
+        if: steps.guard.outputs.ok == 'true'
+        with:
+          qiita-token: ${{ secrets.QIITA_TOKEN }}
+          root: "."
