@@ -26,19 +26,19 @@ https://qiita.com/ys-yoshida/items/6f7c7f85155a993e2c86
 
 こんにちは。株式会社スリーシェイクの太田暢です。
 
-今回は分散トレーシング入門として、RustのWebアプリからECS Fargate上のADOT Collectorを経由し、AWS X-Rayへトレースを送信してみます。
+今回は分散トレーシング入門として、RustのWebアプリからECS Fargate上のADOT Collectorを経由してAWS X-Rayへトレースを送信し、ローカルのGrafanaで確認してみます。
 
 ## ログ・メトリクス・トレース
 
-システムの中で何が起きているかを外から把握できる状態を**オブザーバビリティ**（可観測性）と呼びます。その手がかりになる観測データがメトリクス・ログ・トレースです。
+システムの中で何が起きているかを外から把握できる状態を**オブザーバビリティ**（可観測性）と呼びます。その手がかりになる観測データがメトリクス・ログ・トレースです。今回はトレースに注目していきます。
 
 - **メトリクス**はCPU使用率や応答時間のような時系列の測定値です。一定の間隔で集計され、全体の傾向や急な変化が読み取れます。
 
 - **ログ**は出来事を1行ずつ記録したものです。エラーの内容や処理の経過が発生時刻とともに残ります。
 
-- **トレース**はリクエスト1回が通った経路と、各区間の所要時間の記録です。区間ひとつひとつを**Span**と呼び、同じtrace_idを持つSpanを集めると1本のトレースになります。Spanは入れ子にできるため、「リクエスト全体」の親Spanの中に「データベース照会」の子Spanを持たせる、という親子関係も表現できます。
+- **トレース**はリクエスト1回が通った経路と、各区間の所要時間の記録です。区間ひとつひとつを**Span**と呼び、同じtrace_idを持つSpanを集めると1本のトレースになります。各Spanは開始時刻と所要時間を持つので、時間軸に沿って並べると1回のリクエストの内訳が見えます。
 
-今回はトレースに注目していきます。各Spanは開始時刻と所要時間を持つので、時間軸に沿って並べると1回のリクエストの内訳が見えます。次の図では認証に70 ms、データベース照会に550 ms、描画に90 msという配分になっており、どこで時間を使ったかが読み取れます。
+次の図では認証に70 ms、データベース照会に550 ms、描画に90 msという配分になっており、どこで時間を使ったかが読み取れます。
 
 ![800 msのPOST /orderのSpanの下に、auth check 70 ms・db query 550 ms・render 90 msの子Spanが時間軸に沿って並んだ図](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/44789001-328c-4acf-8c9e-79157d0a5c6b.png)
 
@@ -46,38 +46,38 @@ https://qiita.com/ys-yoshida/items/6f7c7f85155a993e2c86
 
 https://opentelemetry.io/ja/
 
-OpenTelemetryはメトリクス・ログ・トレースなどの観測データを特定の監視サービスに依存せず扱うためのAPI、SDK、プロトコルなどを標準化・提供するオープンソースプロジェクトです。CNCFのgraduatedプロジェクトとして開発されています。
+OpenTelemetryは、メトリクス・ログ・トレースなどの観測データを、特定の監視サービスに依存せず生成・収集・送信するためのAPI、SDK、プロトコルなどを標準化・提供するオープンソースプロジェクトです。CNCFのgraduatedプロジェクトとして開発されています。
 
-アプリケーションの動作を観測できるよう、Spanなどのテレメトリを生成する仕組みを組み込むことを**計装**（instrumentation）と呼びます。
+OpenTelemetryでは、ログ・メトリクス・トレースのような観測データを**シグナル**と呼びます。また、アプリケーションからシグナルを取得できるようにすることを**計装**（instrumentation）と呼びます。トレースの場合は、アプリケーションの処理の中でSpanを生成し、処理時間や属性などを記録できるようにします。
 
-ログ・メトリクス・トレースの3種類のデータはOpenTelemetryの用語で**シグナル**と呼ばれます。
+計装には大きく分けて2つの方法があります。
 
-計装には2通りのやり方があります。
+- **手動計装** — Spanの生成や属性の付与を自分のコードで記述します。Spanが作られて送信されるまでの仕組みを追うため、手動計装を使います。
+- **自動計装** — フレームワーク向けの計装ライブラリやエージェントを利用してSpanを生成します。RustではActix Webなどに[計装ライブラリ](https://opentelemetry.io/docs/languages/rust/libraries/)をミドルウェアとして追加する方法があります。
 
-- **手動計装** — Spanの生成や属性の付与を自分のコードで書きます。今回はSpanが作られて送信されるまでの仕組みを追うため、手動計装を使います。
-- **自動計装** — フレームワーク向けの計装ライブラリやエージェントがSpanを作ります。RustではActix Webなどに[計装ライブラリ](https://opentelemetry.io/docs/languages/rust/libraries/)をミドルウェアとして追加する方法があります。
+今回の構成では、アプリケーションで作成したSpanは次の流れでAWS X-Rayに送られます。
 
-今回の構成では、Spanの作成からX-Rayへの送信までに、主に次の部品が関わります。
+**API → SDK → Exporter → Collector → オブザーバビリティバックエンド（AWS X-Ray）**
 
-**API → SDK → Exporter → Collector → オブザーバビリティバックエンド（今回はX-Ray）**
+- **API** — Spanの開始や終了など、アプリケーションから利用する操作を定義します。Rustでは`opentelemetry`クレートを使います。
+- **SDK** — APIの呼び出しを受けてSpanを処理し、送信するまで一時的に保持します。`opentelemetry_sdk`クレートを使います。
+- **Exporter** — SDKが保持しているSpanを送信用の形式に変換し、Collectorへ送信します。今回は`opentelemetry-otlp`クレートを使います。
+- **Collector** — 観測データを受け取り、必要に応じて処理・変換して送信先へ転送します。
+- **オブザーバビリティバックエンド** — 観測データを保存・検索・可視化するシステムです。Webアプリケーションにおける「バックエンド」とは別の意味で、AWS X-RayやDatadogなどが該当し、送信先にはX-Rayを使います。
 
-この記事では、API・SDK・ExporterをRustのクレートとしてアプリケーションに組み込みます。Collectorはアプリケーションとは別のコンテナとして動き、受け取ったデータをX-Rayへ転送します。
-
-- **API** — Spanの開始や終了など、アプリケーションから利用する操作を定義します。Rustでは`opentelemetry`クレートです。
-- **SDK** — APIの呼び出しを受けてSpanを組み立て、送信まで一時保存します。`opentelemetry_sdk`クレートです。
-- **Exporter** — SDKに一時保存されたSpanを送信用の形式に変換してCollectorへ送ります。今回は`opentelemetry-otlp`クレートです。
-- **Collector** — 受け取ったデータを送り先に合わせて変換し、転送します。
-- **オブザーバビリティバックエンド** — テレメトリを受け取り、保存・検索・可視化するシステムです。Webアプリケーションにおける「バックエンド」とは別の意味で、X-RayやDatadogなどが該当します。今回はX-Rayを使います。
+API・SDK・ExporterはRustのクレートとしてアプリケーションに組み込み、Collectorはアプリケーションとは別のコンテナとして動かします。
 
 ## AWS X-Rayとは
 
-X-RayはAWSのマネージド分散トレーシングサービスです。送られてきたトレースを保存し、検索と表示の画面を提供します。保持期間は30日で、保存の基盤を自前で運用せずに済みます。
+X-RayはAWSのマネージド分散トレーシングサービスです。送られてきたトレースを保存し、検索と表示の画面を提供してくれます。
 
-X-Rayの画面はCloudWatchコンソールに統合されています。2026年8月時点では、トレース関連のメニューはCloudWatchの「Application Signals (APM)」の下にあります。AWSマネジメントコンソールで「X-Ray」を検索して開いても、このCloudWatchの画面へ移動します。
+X-Rayの画面はCloudWatchコンソールに統合されています。2026年8月時点では、トレース関連のメニューはCloudWatchの「Application Signals (APM)」の下にあります（AWSマネジメントコンソールで「X-Ray」を検索して開けばCloudWatchの画面へ移動します）。
+
+トレースをX-Rayへ送る手段としては専用のX-Ray SDKとX-Rayデーモンも提供されてきましたが、両者は2026年2月25日にメンテナンスモードへ移行し、以後のリリースはセキュリティ上の問題への対応に限定されています。AWSからも[OpenTelemetryによる計装への移行](https://docs.aws.amazon.com/ja_jp/xray/latest/devguide/xray-sdk-migration.html)が推奨されています。
 
 ## 今回の構成
 
-トレースはアプリケーションからX-Rayまで次の順で流れます。
+以下の構成でやっていきます。
 
 1. アプリケーションがSpanを作る
 2. Collectorが受け取り、X-Ray向けの形式へ変換して送る
@@ -124,7 +124,7 @@ aws sts get-caller-identity
 
 main.tfのproviderにはap-northeast-1を指定しているため、Terraformが作成するリソースは東京リージョンに置かれます。一方、手順3以降で実行するAWS CLIはCLI側で設定された既定のリージョンを参照します。
 
-両者がずれていると、Terraformで作成したECSクラスタをAWS CLIから見つけられず、`ClusterNotFoundException`になります。
+両者がずれていると、Terraformで作成したECSクラスタをAWS CLIから見つけられず、`ClusterNotFoundException`になるので注意してください。
 
 ```bash
 export AWS_REGION=ap-northeast-1
@@ -170,7 +170,7 @@ opentelemetry_sdk = "0.32.1"          # SDK。Span を一時保存して Exporte
 tokio = { version = "1.53.1", features = ["full"] }  # 非同期ランタイム
 ```
 
-`opentelemetry`・`opentelemetry_sdk`・`opentelemetry-otlp`は互換性のある同じマイナーバージョンで揃えます。ここでは3つとも0.32系です。
+`opentelemetry`・`opentelemetry_sdk`・`opentelemetry-otlp`は互換性のある同じマイナーバージョン（0.32系）で揃えます。
 
 ### src/main.rs
 
@@ -271,11 +271,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 ```
 
-`/ok`は属性を1つ付けたSpanを作ります。`/error`もSpanは1つで、こちらにはエラー状態を付けます。`/slow`はリクエスト全体の親Spanの中に待ち処理の子Spanを作るので、1リクエストでSpanが親子2つになります。
+`/ok`は`app.exercise = "first-trace"`という属性を1つ付けたSpanを作ります。属性はSpanに持たせるkey-valueで、あとからトレースを絞り込む手がかりになります。`/error`もSpanは1つで、こちらにはエラー状態を付けます。`/slow`はリクエスト全体の親Spanの中に待ち処理の子Spanを作るので、1リクエストでSpanが親子2つになります。
 
 ![/ok は属性つきのSpanが1つ、/slow は親子2つ、/error はエラーの印が付いたSpanが1つ生成されることを示した図](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/02b94139-1359-4d21-875b-55b3a8efe62a.png)
 
-ECS停止時にバッチへ残ったSpanを送り切るため、SIGTERMを受けて`provider.shutdown()`を呼びます。後半で実際にタスクを停止して確認します。
+### ECS終了時に残ったSpanを送信する
+
+`with_batch_exporter`はSpanをまとめて送信するため、終了時に未送信のSpanが残る場合があります。このサンプルではSIGTERMを受けてAxumを終了し、`provider.shutdown()`で残ったSpanの送信完了を待ちます。
 
 この構成で使うSDKの既定サンプラーは`ParentBased(AlwaysOn)`で、親Spanの判断を引き継ぎ、親がない場合はすべて記録します。検証では全件を送りますが、X-Rayは記録したトレース数に応じて課金されるため、本番ではトラフィック量に合わせてサンプラーを設定します。
 
@@ -297,13 +299,29 @@ ENTRYPOINT ["/rust-xray-handson"]
 
 ## 2. Terraformでデプロイする
 
-次のような構成にしています。詳細は[こちらのリポジトリ](https://github.com/Ota1022/rust-xray-handson/blob/main/terraform/main.tf)をご覧ください。
+アプリケーションとDockerfileを用意できたので、次はコンテナイメージの保存先とECS Fargateの実行環境をTerraformで作成します。ECSサービスはECR上のイメージを参照するため、次の順で進めます。
 
-- NAT GatewayとALBを作らない。パブリックサブネットにタスクを直接置いて費用を抑える
-- タスクロールに`AWSXRayDaemonWriteAccess`と`CloudWatchAgentServerPolicy`を付ける。X-RayへはアプリではなくADOT Collectorが書き込むため、権限もタスクロール側に付ける
-- ECRリポジトリに`force_delete = true`を指定。イメージが残っていても`terraform destroy`でリポジトリごと消える
+1. ECRリポジトリだけを作成する
+2. コンテナイメージをビルドしてECRへpushする
+3. VPC、IAMロール、ECSサービスなど残りのリソースを作成する
+
+### Terraformで作成するリソース
+
+Terraformの全コードは次の`main.tf`にあります。`rust-xray-handson/terraform/main.tf`として配置すると、VPC、パブリックサブネット、IAMロール、CloudWatch Logs、ECSクラスタ、タスク定義、ECSサービスが作成されます。
+
+https://github.com/Ota1022/rust-xray-handson/blob/main/terraform/main.tf
+
+8080番ポートの接続元は変数`allowed_ingress_cidr`で指定し、`/32`のIPv4 CIDRだけを受け付けます。値はデプロイ手順で自分のグローバルIPアドレスから設定します。
+
+主な設計上の判断は次の3点です。
+
+- NAT GatewayとALBは作りません。パブリックサブネットにタスクを直接置いて費用を抑えます。
+- タスクロールに`AWSXRayDaemonWriteAccess`と`CloudWatchAgentServerPolicy`を付けます。X-RayへはアプリではなくADOT Collectorが書き込むため、権限もタスクロール側に付けます。
+- ECRリポジトリには`force_delete = true`を指定します。イメージが残っていても`terraform destroy`でリポジトリごと消えます。
 
 ![ECRリポジトリ・VPC内のECSサービスとタスク・X-Rayの関係と、実行ロールとタスクロールの使い分けを示した図](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/f146e3b4-cdfc-40b6-abe4-2f1414926fd1.png)
+
+### ECSタスクとCollectorの設定
 
 アプリとADOT Collectorは1つのタスク定義にまとめます。
 
@@ -312,7 +330,6 @@ ENTRYPOINT ["/rust-xray-handson"]
 CloudWatch Logsのログ設定だけ省いたタスク定義です。
 
 ```hcl
-# Apple Silicon でビルドした arm64 イメージをそのまま動かす
 resource "aws_ecs_task_definition" "main" {
   family                   = local.name
   requires_compatibilities = ["FARGATE"]
@@ -344,9 +361,7 @@ resource "aws_ecs_task_definition" "main" {
 }
 ```
 
-Collector側の設定は`command`で指定している[ecs-default-config.yaml](https://github.com/aws-observability/aws-otel-collector/blob/main/config/ecs/ecs-default-config.yaml)だけです。ADOTイメージに同梱されたECS向けのデフォルト設定で、OTLPを4317番で受けたトレースをX-Rayへ送るパイプラインが書かれています。Collector側にportMappingsがないのは、アプリからの4317番が同じタスク内のlocalhost通信で届き、タスクの外へ開ける必要がないからです。
-
-設定のうち、今回関係する部分を抜粋すると次のようになります。トレースは`otlp` Receiverから`awsxray` Exporterへ流れます。メトリクス用には`awsemf` Exporterも定義されており、タスクロールに`CloudWatchAgentServerPolicy`を付けているのはこのデフォルト設定に対応するためです。
+ADOT Collectorには、イメージに同梱された[ECS向けの設定](https://github.com/aws-observability/aws-otel-collector/blob/main/config/ecs/ecs-default-config.yaml)を指定します。
 
 ```yaml
 receivers:
@@ -369,14 +384,21 @@ service:
       exporters: [awsemf]
 ```
 
+`otlp` Receiverは4317番ポートでトレースを受け取り、`awsxray` ExporterがX-Rayへ送信します。`awsemf` Exporterも定義されているため、タスクロールにはCloudWatchへの書き込み権限も付与しています。
+
+Collectorに`portMappings`がないのは、アプリとの通信が同じECSタスク内の`localhost`で完結し、4317番ポートをタスク外へ公開する必要がないためです。
+
 この例では検証を簡単にするため、ADOT Collectorに`:latest`タグを使っています。本番では更新による挙動の変化を避けるため、検証済みのバージョンまたはイメージダイジェストに固定します。
 
 `runtime_platform`はApple Siliconで作成したイメージに合わせて`ARM64`にしています。x86_64環境でビルドする場合は`X86_64`に変更します。
+
+### デプロイ手順
 
 applyは2回に分けます。ECSのタスク定義はECR上のイメージを参照するため、イメージをpushする前にサービスまで作るとタスクが起動に失敗し続けます。そこで`-target`でECRリポジトリだけ先に作ります。
 
 ```bash
 cd rust-xray-handson/terraform
+export TF_VAR_allowed_ingress_cidr="$(curl -sS https://checkip.amazonaws.com)/32"
 terraform init
 terraform apply -target=aws_ecr_repository.app
 ```
@@ -398,13 +420,27 @@ docker push "$REPO:latest"
 terraform apply
 ```
 
+2回目の`terraform apply`では、VPC、IAMロール、CloudWatch Logs、ECSクラスタ、タスク定義、ECSサービスなど残りのリソースが作成されます。ECSサービスが安定し、タスクが`RUNNING`になるまで待ちます。
+
+```bash
+aws ecs wait services-stable \
+  --cluster rust-xray-handson \
+  --services rust-xray-handson
+aws ecs describe-services \
+  --cluster rust-xray-handson \
+  --services rust-xray-handson \
+  --query 'services[0].{desired:desiredCount,running:runningCount}'
+```
+
+`desired`と`running`がどちらも`1`になれば、アプリとADOT Collectorを含むタスクの起動は完了です。次章では、このタスクのパブリックIPを取得してリクエストを送ります。
+
 ## 3. curlでトレースを作る
 
 Spanはリクエストを処理したときに作られるので、リクエストを送ってトレースを発生させます。
 
 ALBを置いていない構成のため、送り先にはタスクのパブリックIPを直接使います。まずIPを調べます。
 
-検証用に8080番のインバウンド通信を許可しますが、セキュリティグループのソースは自分のグローバルIPアドレス（`curl ifconfig.me`などで確認）を`/32`で指定してください。`0.0.0.0/0`には公開しません。
+Terraformで8080番の接続元を自分のグローバルIPアドレスに制限しているため、この環境からだけアクセスできます。
 
 ```bash
 TASK_ARN=$(aws ecs list-tasks --cluster rust-xray-handson --query 'taskArns[0]' --output text)
@@ -423,17 +459,25 @@ curl http://$IP:8080/slow
 curl http://$IP:8080/error
 ```
 
-## 4. CloudWatchコンソールで見る
+## 4. コンソールとCLIでトレースを見る
 
-X-Rayに届いたトレースを見にいきましょう。AWSコンソールでCloudWatchを開き、左メニューの「Application Signals (APM)」から「トレースマップ」を選びます。Spanはバッチでまとめて送られるため、反映までに1分程度かかります。
+### トレースマップで見る
+
+AWSコンソールで「X-Ray」を検索して選択すると「Application Signals (APM)」から「トレースマップ」が開きます。
 
 ![X-RayのトレースマップにクライアントとGET /okのノードが表示され、両者が100% OKの線で結ばれている画面](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/5f1b36ab-46e2-4076-a9b0-e1585ffa2463.png)
 
-自分で書いたSpanがSDKからサイドカーを通ってマネージドサービスまで届いています。エラーを返したほうは赤いノードです。
+クライアントと`GET /ok`の2つのノードが線で結ばれ、100% OKと表示されています。アプリのSDKが作ったSpanがサイドカーのCollectorを経由してX-Rayまで届いています。
+
+`/error`のトレースマップも開きます。
 
 ![X-RayのトレースマップでGET /errorのノードが赤く表示され、障害100%と示されている画面](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/531a48b1-7684-42a8-ac6d-498767394c78.png)
 
-次に、コードで設定したSpan名・属性・エラー状態がX-Ray上でどのように表現されているかを確認します。`batch-get-traces`にはトレースIDが必要なので、直近10分のトレースから1件取得します。次の`date`はmacOSの書式です。
+`GET /error`のノードは赤で表示され、障害100%となっています。コードで`Status::error`を付けたSpanはここで障害として集計されます。
+
+### セグメントの中身を見る
+
+X-RayはSpanを**セグメント**という単位で保存しています。セグメントを直接取得すると、コンソールの表示がコードのどこから来ているかを確認できます。`batch-get-traces`にはトレースIDが必要なので、直近10分のトレースから1件取得します。
 
 ```bash
 TRACE_ID=$(aws xray get-trace-summaries \
@@ -442,112 +486,58 @@ TRACE_ID=$(aws xray get-trace-summaries \
 aws xray batch-get-traces --trace-ids "$TRACE_ID"
 ```
 
-セグメントの中身は次のように対応しています。
+セグメントの本体はレスポンスの`Segments[].Document`にJSON文字列として入っています。`/ok`のセグメントを整形すると次のとおりです。
+
+```json
+{
+  "id": "826f1f41cf80f773",
+  "name": "GET /ok",
+  "start_time": 1788059844.007899,
+  "trace_id": "1-9cb42327-fe31b713c474041f9862d0a9",
+  "end_time": 1788059844.007901,
+  "fault": false,
+  "error": false,
+  "throttle": false,
+  "aws": {
+    "xray": {
+      "auto_instrumentation": false,
+      "sdk_version": "0.32.1",
+      "sdk": "opentelemetry for rust"
+    }
+  },
+  "metadata": {
+    "default": {
+      "otel.resource.telemetry.sdk.name": "opentelemetry",
+      "app.exercise": "first-trace",
+      "otel.resource.service.name": "rust-xray-handson",
+      "otel.resource.telemetry.sdk.language": "rust",
+      "otel.resource.telemetry.sdk.version": "0.32.1"
+    }
+  }
+}
+```
+
+`/slow`と`/error`のセグメントも合わせると、コードで書いたものは次の場所に現れています。
 
 | コードで書いたもの | X-Ray上の位置 |
 | --- | --- |
+| Span名の`GET /ok` | セグメントの`name` |
 | `KeyValue::new("app.exercise", "first-trace")` | `metadata.default.app.exercise` |
 | `Status::error("simulated failure")` | `fault: true`と`cause.exceptions[0].message` |
 | 子Spanの`wait_backend` | 親セグメントの`subsegments[]`（実測500.7ms） |
 | `with_service_name("rust-xray-handson")` | `metadata.default.otel.resource.service.name` |
 
-ADOT Collectorが変換したことはセグメントの`aws.xray`から分かります。
+トレースマップのノード名は`name`に入ったSpan名です。`service.name`はノード名にならないため、アプリは1つでもマップは`GET /ok`・`GET /slow`・`GET /error`の3つのノードに分かれます。
 
-```json
-"aws": { "xray": { "sdk": "opentelemetry for rust", "sdk_version": "0.32.1", "auto_instrumentation": false } }
-```
+## 5. X-RayのトレースをGrafanaから見る
 
-属性はAnnotationsではなくMetadataに入ります。X-Rayはこの2つを区別していて、フィルタ式で検索できるのはAnnotationsだけです。`app.exercise = "first-trace"`でトレースを絞り込む、という使い方はこのままではできません。検索したい属性はCollector側でawsxrayエクスポーターの`indexed_attributes`に挙げ、Annotationsへ昇格させます。
-
-今回のサービスマップでは、Span名がノード名になるため`GET /ok`・`GET /slow`・`GET /error`の3つに分かれます。`service.name`はmetadataとして保存され、このノード名には使われません。
-
-## 自動計装との差分
-
-ここまでのSpanはすべて手動で作成しています。では、自動計装を使った場合は何が変わるのでしょうか。
-
-OpenTelemetry公式デモのRustサービス[`src/shipping`](https://github.com/open-telemetry/opentelemetry-demo/tree/main/src/shipping)と比較します。公式デモもこの記事と同じOpenTelemetry 0.32系を使用しています。
-
-| 観点 | この記事（手書き） | 公式デモ（自動計装） |
-| --- | --- | --- |
-| 計装 | ハンドラごとにSpanを手書き | `opentelemetry-instrumentation-actix-web`のミドルウェア |
-| 応答時間 | `span.end()`の位置しだいで0になる。`/ok`はX-Ray上2.1 µs（実測の応答は約20 ms） | リクエスト全体が1つのSpanになる |
-| HTTP属性 | 付けていない。トレース一覧のメソッド・ステータスの列が空になる | セマンティック規約に沿って自動で付く |
-| Propagator | 設定なし | `TraceContextPropagator`を明示設定 |
-| Resource | `service_name`のみ | Host / OS / ProcessのDetectorで自動収集 |
-| シグナル | トレースのみ | トレース・ログ・メトリクスの3本 |
-| 終了処理 | `provider.shutdown()`を1回 | tracer → logger → meterの順に3つ |
-
-自動計装は少ない実装でリクエスト全体を継続的に計測でき、HTTP属性も一定の形式で揃います。手動計装はSpanを作るコードが必要になる一方、計測する区間や属性を用途に合わせて決められます。どちらか一方を選ぶだけでなく、自動計装でリクエスト境界を捉え、`wait_backend`のような内部処理を手動計装で補う構成も取れます。
-
-## ECSタスク停止時に未送信のSpanを送る
-
-`with_batch_exporter`を使うと生成したSpanはメモリに一時保存され、既定で5秒ごとにまとめて送信されます。そのためECSタスクが停止するタイミングによっては、未送信のSpanがアプリケーション内に残ることがあります。
-
-未送信のSpanを送ってから終了するには次の順序で処理します。
-
-1. ECSから送られるSIGTERMを受け取る
-2. Axumサーバーを終了する
-3. `provider.shutdown()`を呼び出す
-4. Spanの送信が完了してからプロセスを終了する
-
-`main.rs`では、`with_graceful_shutdown`にSIGTERMを待つ`shutdown_signal()`を渡しています。
-
-```rust
-axum::serve(listener, app)
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
-
-provider.shutdown()?;
-```
-
-SIGTERMを受け取ると`shutdown_signal()`が完了し、`axum::serve`から次の行へ進みます。そこで`provider.shutdown()`が呼ばれ、バッチに残っているSpanが送信されます。
-
-ECSはSIGTERMを送ったあと既定では30秒後にSIGKILLでプロセスを強制終了します。終了処理はこの時間内に完了させます。
-
-![SIGTERMからSIGKILLまでの30秒の区間で、with_graceful_shutdownなしはその場で終了して未送信のSpanが消え、ありは残りを送り切ってから終了することを示した図](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/e8c6c0cb-91d2-4cd8-ac1e-0eae8448154d.png)
-
-### ECS上での確認
-
-停止直前に`/ok`を3回呼び出し、バッチに未送信のSpanがある状態でECSタスクを停止しました。
-
-| 時刻 | コンテナ | 出力 |
-| --- | --- | --- |
-| 12:19:57.971 | app | `shutdown signal received` |
-| 12:19:57.972 | app | `tracer provider shut down` |
-| 12:19:57.998 | adot-collector | `Received signal from OS` |
-| 12:19:57.999 | adot-collector | `Shutdown complete.` |
-
-アプリケーションの終了処理が実行され、停止直前の3リクエストもX-Rayに記録されていました。
-
-この構成ではアプリケーションの送信完了からCollectorの終了まで27 msしかありませんでした。また、コンテナ間の依存関係を指定していないため、この停止順序は保証されません。
-
-本番で同じサイドカー構成を使う場合は、タスク定義でアプリケーションからCollectorへの[コンテナ依存関係](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html#container_definition_dependson)を指定します。ECSは起動時の依存関係を停止時には逆順で適用するため、アプリケーションを停止してからCollectorを停止できます。あわせて`stopTimeout`を指定し、`provider.shutdown()`が完了するまでの時間を確保します。
-
-```hcl
-dependsOn  = [{ containerName = "adot-collector", condition = "START" }]
-stopTimeout = 60
-```
-
-`stopTimeout`の既定値は30秒で、Fargateでは最大120秒です。
-
-## X-RayのトレースをGrafanaから見る
-
-同じトレースをGrafanaからも確認します。
-
-Grafana自体はローカルのDockerコンテナで動かします。
-
-AWS Application Signalsデータソースプラグインv2.17.1の追加画面では、「X-Ray」と検索しても表示されません。「Application Signals」で検索してください。プラグインのIDは`grafana-x-ray-datasource`のままですが、表示名は「AWS Application Signals」に変わっています。
-
-![Grafanaのデータソース追加画面で「Application Signals」と検索し、AWS Application Signalsが1件表示されている画面](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/44835312-6466-47bd-8ebf-0153f37a48b9.png)
+同じトレースをGrafanaからも確認します。Grafana自体はローカルのDockerコンテナで動かします。
 
 ### Grafanaを起動する
 
-GrafanaのX-RayデータソースにはAWS認証情報が必要です。ここでは、事前に設定したIAM Identity Centerのプロファイルから一時クレデンシャルを取得し、「Access & secret key」方式でデータソースに渡します。
-
-一時クレデンシャルでは、アクセスキーとシークレットキーに加えてセッショントークンも必要です。プロビジョニングファイルの`secureJsonData`に3つの環境変数を指定します。
+X-RayデータソースにはAWS認証情報が必要です。プロビジョニングファイルで渡します。
 
 ```yaml
-# provisioning/datasources/xray.yaml
 apiVersion: 1
 datasources:
   - name: X-Ray
@@ -562,7 +552,7 @@ datasources:
       sessionToken: $AWS_SESSION_TOKEN
 ```
 
-`aws configure export-credentials`で現在のプロファイルから認証情報を取得し、Grafanaコンテナへ渡します。
+このファイルを置いたディレクトリで起動します。
 
 ```bash
 eval "$(aws configure export-credentials --format env)"
@@ -573,19 +563,13 @@ docker run -d --rm --name grafana-xray -p 127.0.0.1:3001:3000 \
   grafana/grafana:13.2.0
 ```
 
-ポートは`127.0.0.1:3001`にだけ公開し、AWS認証情報を持つGrafanaコンテナに他の端末からアクセスできないようにしています。初回起動ではプラグインのダウンロードに30秒ほどかかります。
-
-一時クレデンシャルの有効期限が切れた場合は、`aws sso login`と`eval "$(aws configure export-credentials --format env)"`を再実行します。その後、既存のGrafanaコンテナを削除し、上の`docker run`コマンドで作り直します。コンテナを再起動するだけでは、作成時に渡した環境変数は更新されません。
-
 ### Grafanaでトレースを見る
 
-`http://127.0.0.1:3001`を開き、admin / adminでログインします。X-Rayデータソースはプロビジョニングによって登録されています。
+`http://127.0.0.1:3001`をadmin / adminで開きます。X-Rayデータソースは登録済みです。
 
 Exploreを開き、Query Typeに「Trace List」、期間に「Last 1 hour」を指定すると、X-Rayに保存されたトレースの一覧を確認できます。
 
 ![GrafanaのTrace Listに19件のトレースが並び、Response Time列に501 msと0 sが混在している画面](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/92a07c40-09e5-44fb-b984-0ececb42745c.png)
-
-Method・Response・URL・Client IPの列がすべて空です。「自動計装との差分」で見たとおり、手動計装でHTTP関連のセマンティック規約属性を付けていないと一覧はこのように表示されます。
 
 一覧からTrace IDを開くとタイムラインになります。
 
@@ -599,7 +583,25 @@ Method・Response・URL・Client IPの列がすべて空です。「自動計装
 
 `Status::error`を付けたSpanには赤い印が付きます。X-Rayのセグメントで`fault: true`になっていたものがGrafanaではこの表示になります。
 
-## かかった費用
+## 6. 自動計装との差分
+
+ここまでSpanを手動で作成してきましたが、自動計装を使った場合は何が変わるのでしょうか。
+
+OpenTelemetry公式デモのRustサービス[`src/shipping`](https://github.com/open-telemetry/opentelemetry-demo/tree/main/src/shipping)と比較します。公式デモもこの記事と同じOpenTelemetry 0.32系を使用しています。
+
+| 観点 | この記事（手書き） | 公式デモ（自動計装） |
+| --- | --- | --- |
+| 計装 | ハンドラごとにSpanを手書き | `opentelemetry-instrumentation-actix-web`のミドルウェア |
+| 応答時間 | `span.end()`の位置しだいで0になる。`/ok`はX-Ray上2.1 µs（実測の応答は約20 ms） | リクエスト全体が1つのSpanになる |
+| HTTP属性 | 付けていない。トレース一覧のメソッド・ステータスの列が空になる | セマンティック規約に沿って自動で付く |
+| Propagator | 設定なし | `TraceContextPropagator`を明示設定 |
+| Resource | `service_name`のみ | Host / OS / ProcessのDetectorで自動収集 |
+| シグナル | トレースのみ | トレース・ログ・メトリクスの3本 |
+| 終了処理 | `provider.shutdown()`を1回 | tracer → logger → meterの順に3つ |
+
+自動計装は少ない実装でリクエスト全体を継続的に計測でき、HTTP属性も一定の形式で揃います。手動計装はSpanを作るコードが必要になる一方、計測する区間や属性を用途に合わせて決められます。自動計装でリクエスト境界を捉え、`wait_backend`のような内部処理を手動計装で補う構成が良さそうです。
+
+## 7. かかった費用
 
 この検証で継続的に発生する費用の大半はFargateタスクとパブリックIPv4アドレスによるものです。これらに加えて、ECRのイメージ保存も使用量に応じて課金されます。
 
@@ -610,11 +612,9 @@ Method・Response・URL・Client IPの列がすべて空です。「自動計装
 | パブリックIPv4 | 1個 × $0.005/h | $0.00500 |
 | 合計 | | $0.01732 |
 
-1 USD = 150円で換算すると約2.6円/時で、4時間動かすと約10円、12時間では約31円です。今回のX-Ray、CloudWatch Logs、データ転送の使用量は小さいため、アカウント内の他用途を含めて無料枠の上限を超えなければ追加料金は発生しません。
+単価はAWS Price List APIから取得した実測値です。
 
-単価はAWS Price List APIから取得した実測値です。パブリックIPv4を除いてFargate料金だけで見積もると、実際の合計より約29%安くなります。
-
-Grafanaでの確認まで終えたら、検証環境を削除します。X-Rayのトレースは30日間保持されるため、削除後も確認できます。
+Grafanaでの確認まで終えたら検証環境を削除します。X-Rayのトレースは30日間保持されるため、削除後も確認できます。
 
 ```bash
 terraform destroy
@@ -622,11 +622,11 @@ terraform destroy
 
 ## おわりに
 
-今回はRustアプリケーションでOpenTelemetryのSpanを手動で作成し、ECS Fargate上のADOT Collectorを経由してX-Rayへ送信しました。
+RustアプリケーションでOpenTelemetryのSpanを手動で作成し、ECS Fargate上のADOT Collectorを経由してX-Rayへ送信しました。
 
-どこをSpanとして切り出しどの情報を持たせるかによってX-RayやGrafanaでの見え方は変わります。今後はトレースを送る仕組みに加えて計装そのものの設計についても知見を深めていきたいです。
+どこをSpanとして切り出しどの情報を持たせるかによってX-RayやGrafanaでの見え方は変わります。今後もトレースを送る仕組みや計装の設計について見識を深めていきたいと思います。
 
-最後までお読みいただきありがとうございました。
+最後までお読みいただきありがとうございました！
 
 ## 参考
 
