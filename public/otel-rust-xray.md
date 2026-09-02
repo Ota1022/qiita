@@ -28,13 +28,13 @@ https://qiita.com/ys-yoshida/items/6f7c7f85155a993e2c86
 
 今回は分散トレーシング入門として、RustのWebアプリからECS Fargate上のADOT Collectorを経由してAWS X-Rayへトレースを送信し、ローカルのGrafanaで確認してみます。
 
-## ログ・メトリクス・トレース
+## メトリクス・ログ・トレース
 
 システムの中で何が起きているかを外から把握できる状態を**オブザーバビリティ**（可観測性）と呼びます。その手がかりになる観測データがメトリクス・ログ・トレースです。今回はトレースに注目していきます。
 
-- **メトリクス**はCPU使用率や応答時間のような時系列の測定値です。一定の間隔で集計され、全体の傾向や急な変化が読み取れます。
+- **メトリクス**はCPU使用率や応答時間などを数値として時系列で記録したものです。全体の傾向や変化を把握するのに向いています。
 
-- **ログ**は出来事を1行ずつ記録したものです。エラーの内容や処理の経過が発生時刻とともに残ります。
+- **ログ**は、アプリケーションやシステムで発生した個々の出来事を記録したものです。エラーの内容や処理の経過を、発生時刻などとともに残せます。
 
 - **トレース**はリクエスト1回が通った経路と、各区間の所要時間の記録です。区間ひとつひとつを**Span**と呼び、同じtrace_idを持つSpanを集めると1本のトレースになります。各Spanは開始時刻と所要時間を持つので、時間軸に沿って並べると1回のリクエストの内訳が見えます。
 
@@ -50,10 +50,10 @@ OpenTelemetryは、メトリクス・ログ・トレースなどの観測デー�
 
 OpenTelemetryでは、ログ・メトリクス・トレースのような観測データを**シグナル**と呼びます。また、アプリケーションからシグナルを取得できるようにすることを**計装**（instrumentation）と呼びます。トレースの場合は、アプリケーションの処理の中でSpanを生成し、処理時間や属性などを記録できるようにします。
 
-計装には大きく分けて2つの方法があります。
+この記事では、Rustのアプリケーションコードに組み込む計装として、手動計装と計装ライブラリを利用した計装を扱います。
 
-- **手動計装** — Spanの生成や属性の付与を自分のコードで記述します。Spanが作られて送信されるまでの仕組みを追うため、手動計装を使います。
-- **自動計装** — フレームワーク向けの計装ライブラリやエージェントを利用してSpanを生成します。RustではActix Webなどに[計装ライブラリ](https://opentelemetry.io/docs/languages/rust/libraries/)をミドルウェアとして追加する方法があります。
+- **手動計装** — Spanの生成や属性の付与をアプリケーションコードに自分で記述します。今回はSpanが作られて送信されるまでの仕組みを追うため、この方法を使います。
+- **計装ライブラリを利用した計装** — Webフレームワークなどに対応したライブラリを組み込むことで、HTTPリクエストなどのSpanや属性を一定の形式で生成できます。RustではActix Web向けなどの[計装ライブラリ](https://opentelemetry.io/docs/languages/rust/libraries/)があります。
 
 今回の構成では、アプリケーションで作成したSpanは次の流れでAWS X-Rayに送られます。
 
@@ -81,7 +81,7 @@ X-Rayの画面はCloudWatchコンソールに統合されています。2026年8
 
 1. アプリケーションがSpanを作る
 2. Collectorが受け取り、X-Ray向けの形式へ変換して送る
-3. X-Rayが保存し、コンソールやGrafanaから読む
+3. X-Rayに保存し、X-RayコンソールやGrafanaから確認する
 
 ![ECS FargateタスクのRustアプリからADOT Collector経由でX-Rayへトレースを送り、X-RayコンソールとローカルのGrafanaで読む構成](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/ca223abf-0cc6-49dc-9091-6ba581c7334d.png)
 
@@ -273,6 +273,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 `/ok`は`app.exercise = "first-trace"`という属性を1つ付けたSpanを作ります。属性はSpanに持たせるkey-valueで、あとからトレースを絞り込む手がかりになります。`/error`もSpanは1つで、こちらにはエラー状態を付けます。`/slow`はリクエスト全体の親Spanの中に待ち処理の子Spanを作るので、1リクエストでSpanが親子2つになります。
 
+今回はSpanを作る仕組みを追いやすくするため、`SpanKind::Server`やHTTPのSemantic Conventions（セマンティック規約）に沿った属性は設定していません。そのため、ここで作るSpanはHTTPサーバーSpanではなく、既定のInternal Spanとして扱われます。この違いは、後ほどフレームワーク向けの計装ライブラリを利用した場合と比較します。
+
 ![/ok は属性つきのSpanが1つ、/slow は親子2つ、/error はエラーの印が付いたSpanが1つ生成されることを示した図](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/02b94139-1359-4d21-875b-55b3a8efe62a.png)
 
 ### ECS終了時に残ったSpanを送信する
@@ -316,7 +318,7 @@ https://github.com/Ota1022/rust-xray-handson/blob/main/terraform/main.tf
 主な設計上の判断は次の3点です。
 
 - NAT GatewayとALBは作りません。パブリックサブネットにタスクを直接置いて費用を抑えます。
-- タスクロールに`AWSXRayDaemonWriteAccess`と`CloudWatchAgentServerPolicy`を付けます。X-RayへはアプリではなくADOT Collectorが書き込むため、権限もタスクロール側に付けます。
+- タスクロールに`AWSXRayDaemonWriteAccess`と`CloudWatchAgentServerPolicy`を付けます。ADOT CollectorのECS向けdefault configには、X-Rayへのtraces pipelineに加えてCloudWatchへ送るmetrics pipelineも含まれるため、このサンプルでは両方への書き込み権限を付与しています。アプリケーションから送るシグナルは、今回はトレースのみです。
 - ECRリポジトリには`force_delete = true`を指定します。イメージが残っていても`terraform destroy`でリポジトリごと消えます。
 
 ![ECRリポジトリ・VPC内のECSサービスとタスク・X-Rayの関係と、実行ロールとタスクロールの使い分けを示した図](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/f146e3b4-cdfc-40b6-abe4-2f1414926fd1.png)
@@ -364,27 +366,50 @@ resource "aws_ecs_task_definition" "main" {
 ADOT Collectorには、イメージに同梱された[ECS向けの設定](https://github.com/aws-observability/aws-otel-collector/blob/main/config/ecs/ecs-default-config.yaml)を指定します。
 
 ```yaml
+extensions:
+  health_check:
+
 receivers:
   otlp:
     protocols:
       grpc:
         endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  awsxray:
+    endpoint: 0.0.0.0:2000
+    transport: udp
+  statsd:
+    endpoint: 0.0.0.0:8125
+    aggregation_interval: 60s
+
+processors:
+  batch/traces:
+    timeout: 1s
+    send_batch_size: 50
+  batch/metrics:
+    timeout: 60s
 
 exporters:
   awsxray:
   awsemf:
+    namespace: ECS/AWSOTel/Application
+    log_group_name: '/aws/ecs/application/metrics'
 
 service:
   pipelines:
     traces:
       receivers: [otlp, awsxray]
+      processors: [batch/traces]
       exporters: [awsxray]
     metrics:
       receivers: [otlp, statsd]
+      processors: [batch/metrics]
       exporters: [awsemf]
+  extensions: [health_check]
 ```
 
-`otlp` Receiverは4317番ポートでトレースを受け取り、`awsxray` ExporterがX-Rayへ送信します。`awsemf` Exporterも定義されているため、タスクロールにはCloudWatchへの書き込み権限も付与しています。
+`otlp` Receiverは4317番ポートのgRPCと4318番ポートのHTTPでデータを受け取ります。traces pipelineは受信したトレースを`batch/traces` Processorでまとめ、`awsxray` ExporterからX-Rayへ送信します。default configにはmetrics pipelineもあり、OTLPまたはStatsDで受信したメトリクスを`batch/metrics` Processorを経由して`awsemf` ExporterからCloudWatchへ送ります。このサンプルのアプリケーションが送るのはトレースだけですが、default configのmetrics pipelineも利用できるように`CloudWatchAgentServerPolicy`を付与しています。
 
 Collectorに`portMappings`がないのは、アプリとの通信が同じECSタスク内の`localhost`で完結し、4317番ポートをタスク外へ公開する必要がないためです。
 
@@ -403,7 +428,7 @@ terraform init
 terraform apply -target=aws_ecr_repository.app
 ```
 
-`-target`を指定するとTerraformから警告が表示されますが、ここではイメージの保存先だけを先に作るために意図して使用しています。
+`-target`は、通常のTerraform運用で常用することが推奨されている方法ではなく、例外的な状況で使うためのオプションです。今回はECR作成→イメージpush→ECS作成という手順を1つのサンプル構成で再現するため、ハンズオン上の便宜として使用しています。
 
 ```bash
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -475,9 +500,9 @@ AWSコンソールで「X-Ray」を検索して選択すると「Application Sig
 
 `GET /error`のノードは赤で表示され、障害100%となっています。コードで`Status::error`を付けたSpanはここで障害として集計されます。
 
-### セグメントの中身を見る
+### Segmentの中身を見る
 
-X-RayはSpanを**セグメント**という単位で保存しています。セグメントを直接取得すると、コンソールの表示がコードのどこから来ているかを確認できます。`batch-get-traces`にはトレースIDが必要なので、直近10分のトレースから1件取得します。
+OpenTelemetryではトレースの区間をSpan、X-RayではトレースデータをSegment / Subsegmentという形式で扱います。ADOT CollectorのX-Ray Exporterは、OpenTelemetryのSpanをX-Rayの形式へ変換して送信します。Segmentを直接取得すると、コンソールの表示がコードのどこから来ているかを確認できます。`batch-get-traces`にはトレースIDが必要なので、直近10分のトレースから1件取得します。
 
 ```bash
 TRACE_ID=$(aws xray get-trace-summaries \
@@ -486,7 +511,7 @@ TRACE_ID=$(aws xray get-trace-summaries \
 aws xray batch-get-traces --trace-ids "$TRACE_ID"
 ```
 
-セグメントの本体はレスポンスの`Segments[].Document`にJSON文字列として入っています。`/ok`のセグメントを整形すると次のとおりです。
+Segmentの本体はレスポンスの`Segments[].Document`にJSON文字列として入っています。以下は、実際に取得した`/ok`のSegmentを整形した例です。
 
 ```json
 {
@@ -517,17 +542,17 @@ aws xray batch-get-traces --trace-ids "$TRACE_ID"
 }
 ```
 
-`/slow`と`/error`のセグメントも合わせると、コードで書いたものは次の場所に現れています。
+`/slow`と`/error`のSegmentも合わせると、コードで書いたものは次の場所に現れています。
 
 | コードで書いたもの | X-Ray上の位置 |
 | --- | --- |
-| Span名の`GET /ok` | セグメントの`name` |
+| Span名の`GET /ok` | Segmentの`name` |
 | `KeyValue::new("app.exercise", "first-trace")` | `metadata.default.app.exercise` |
 | `Status::error("simulated failure")` | `fault: true`と`cause.exceptions[0].message` |
-| 子Spanの`wait_backend` | 親セグメントの`subsegments[]`（実測500.7ms） |
+| 子Spanの`wait_backend` | 親Segmentの`subsegments[]`（実測500.7ms） |
 | `with_service_name("rust-xray-handson")` | `metadata.default.otel.resource.service.name` |
 
-トレースマップのノード名は`name`に入ったSpan名です。`service.name`はノード名にならないため、アプリは1つでもマップは`GET /ok`・`GET /slow`・`GET /error`の3つのノードに分かれます。
+今回のSpanでは`SpanKind::Server`を設定していないため、`GET /ok`などのSpan名がそのままX-RayのSegment名として現れています。その結果、トレースマップでは`GET /ok`・`GET /slow`・`GET /error`が別々のノードとして表示されます。HTTPサーバー向けの計装ライブラリではServer SpanやHTTP属性が設定されるため、X-Ray上での見え方も異なります。
 
 ## 5. X-RayのトレースをGrafanaから見る
 
@@ -538,6 +563,7 @@ aws xray batch-get-traces --trace-ids "$TRACE_ID"
 X-RayデータソースにはAWS認証情報が必要です。プロビジョニングファイルで渡します。
 
 ```yaml
+# provisioning/datasources/xray.yaml
 apiVersion: 1
 datasources:
   - name: X-Ray
@@ -575,31 +601,32 @@ Exploreを開き、Query Typeに「Trace List」、期間に「Last 1 hour」を
 
 ![Grafanaのタイムラインで、GET /slowの下にwait_backendが500.67 msの帯として入れ子で表示されている画面](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/a057cd35-fd3a-4c34-9221-46fe99eace6e.png)
 
-`GET /slow`の下に`wait_backend`が入れ子になり、500.67 msを占めています。コードで`start_with_context`を使って親子にしたものがそのままこの形で出てきます。この表示ではGrafanaがセグメントの上にルートSpanを1つ追加するため、Span数は3になります。
+`GET /slow`の下に`wait_backend`が入れ子になり、500.67 msを占めています。コードで`start_with_context`を使って親子にしたものがそのままこの形で出てきます。この表示ではGrafanaがSegmentの上にルートSpanを1つ追加するため、Span数は3になります。
 
 `/error`のトレースも確認します。
 
 ![Grafanaのタイムラインで、GET /errorのSpanに赤いエラーアイコンが付いている画面](https://qiita-image-store.s3.ap-northeast-1.amazonaws.com/0/4244797/fd5d65df-881c-497a-9bab-948f95983ee5.png)
 
-`Status::error`を付けたSpanには赤い印が付きます。X-Rayのセグメントで`fault: true`になっていたものがGrafanaではこの表示になります。
+`Status::error`を付けたSpanには赤い印が付きます。X-RayのSegmentで`fault: true`になっていたものがGrafanaではこの表示になります。
 
-## 6. 自動計装との差分
+## 6. 計装ライブラリを使った場合との差分
 
-ここまでSpanを手動で作成してきましたが、自動計装を使った場合は何が変わるのでしょうか。
+ここまでSpanを手動で作成してきましたが、フレームワーク向けの計装ライブラリを使った場合は何が変わるのでしょうか。
 
 OpenTelemetry公式デモのRustサービス[`src/shipping`](https://github.com/open-telemetry/opentelemetry-demo/tree/main/src/shipping)と比較します。公式デモもこの記事と同じOpenTelemetry 0.32系を使用しています。
 
-| 観点 | この記事（手書き） | 公式デモ（自動計装） |
+| 観点 | この記事（手書き） | 公式デモ（計装ライブラリ） |
 | --- | --- | --- |
 | 計装 | ハンドラごとにSpanを手書き | `opentelemetry-instrumentation-actix-web`のミドルウェア |
+| SpanKind | 未指定のためInternal | HTTPリクエストをServer Spanとして生成 |
 | 応答時間 | `span.end()`の位置しだいで0になる。`/ok`はX-Ray上2.1 µs（実測の応答は約20 ms） | リクエスト全体が1つのSpanになる |
-| HTTP属性 | 付けていない。トレース一覧のメソッド・ステータスの列が空になる | セマンティック規約に沿って自動で付く |
+| HTTP属性 | 付けていない。トレース一覧のメソッド・ステータスの列が空になる | セマンティック規約に沿って生成 |
 | Propagator | 設定なし | `TraceContextPropagator`を明示設定 |
-| Resource | `service_name`のみ | Host / OS / ProcessのDetectorで自動収集 |
+| Resource | `service.name`のみ明示設定 | Host / OS / ProcessのDetectorを利用 |
 | シグナル | トレースのみ | トレース・ログ・メトリクスの3本 |
 | 終了処理 | `provider.shutdown()`を1回 | tracer → logger → meterの順に3つ |
 
-自動計装は少ない実装でリクエスト全体を継続的に計測でき、HTTP属性も一定の形式で揃います。手動計装はSpanを作るコードが必要になる一方、計測する区間や属性を用途に合わせて決められます。自動計装でリクエスト境界を捉え、`wait_backend`のような内部処理を手動計装で補う構成が良さそうです。
+手動計装では、計測区間だけでなくSpanKindや属性も用途に合わせて設計する必要があります。HTTPリクエストのように標準化された処理は、計装ライブラリを使うとSemantic Conventionsに沿った情報を付与しやすくなります。一方、`wait_backend`のようなアプリケーション固有の内部処理は、手動Spanで補えます。共通処理は計装ライブラリで捉え、独自処理を手動計装で補う構成が扱いやすそうです。
 
 ## 7. かかった費用
 
@@ -624,7 +651,9 @@ terraform destroy
 
 RustアプリケーションでOpenTelemetryのSpanを手動で作成し、ECS Fargate上のADOT Collectorを経由してX-Rayへ送信しました。
 
-どこをSpanとして切り出しどの情報を持たせるかによってX-RayやGrafanaでの見え方は変わります。今後もトレースを送る仕組みや計装の設計について見識を深めていきたいと思います。
+実際にX-RayやGrafanaで確認すると、Spanを送るだけでなく、どこをSpanとして切り出すか、どのSpanKindや属性を持たせるか、親子関係をどう作るかによってオブザーバビリティバックエンド上の見え方が変わることが分かりました。
+
+手動計装はSpanが作られて送られる仕組みを理解しやすい一方、HTTPリクエストのような共通処理では、SpanKindやSemantic Conventionsに沿った属性も自分で設定する必要があります。今回の検証を踏まえると、実際のアプリケーションでは、フレームワーク向けの計装ライブラリでリクエスト境界を捉えつつアプリケーション固有の処理を手動Spanで補う形も選択肢になりそうです。
 
 最後までお読みいただきありがとうございました！
 
