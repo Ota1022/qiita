@@ -3,12 +3,12 @@ title: Rust + OpenTelemetryで分散トレーシング入門 ― ECS Fargateか�
 tags:
   - Rust
   - AWS
-  - OpenTelemetry
+  - opentelemetry
   - ECS
   - Jr.Champions
 private: false
-updated_at: ''
-id: null
+updated_at: '2026-09-04T10:15:06+09:00'
+id: 54762eaae03b84252a3f
 organization_url_name: null
 slide: false
 ignorePublish: false
